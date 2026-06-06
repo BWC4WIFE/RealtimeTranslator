@@ -7,6 +7,12 @@ options:
   createIntermediateGroups: true
   xcodeVersion: "16"
 
+# ── SPM packages ─────────────────────────────────────────────────────────────
+packages:
+  WhisperKit:
+    url: https://github.com/argmaxinc/WhisperKit
+    from: "0.9.0"
+
 settings:
   base:
     SWIFT_VERSION: "5.10"
@@ -22,9 +28,16 @@ targets:
     sources:
       - path: Sources/RealtimeTranslator
         type: group
+        excludes:
+          - AppleTranslator.swift   # deleted; replaced by AppleTranslationEngine.swift
 
     resources:
       - Resources/Assets.xcassets
+
+    # WhisperKit provides whisper.cpp + CoreML encoder for ANE
+    dependencies:
+      - package: WhisperKit
+        product: WhisperKit
 
     info:
       path: Resources/Info.plist

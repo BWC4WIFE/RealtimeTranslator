@@ -3,16 +3,20 @@ import AVFoundation
 import Speech
 import Observation
 
-// MARK: - Models
+// MARK: - Types
 
-enum ActiveMic { case none, english, spanish }
+enum TranslationEngineType: String, CaseIterable, Identifiable {
+    case auto    = "Auto"
+    case whisper = "Whisper (ANE)"
+    case apple   = "Apple Translate"
+    var id: String { rawValue }
+}
 
 struct TranslationMessage: Identifiable {
     let id        = UUID()
     let english:    String
-    let spanish:    String
-    let sourceLang: String   // "en" | "es"  → determina el color en la UI
-    let timestamp = Date()
+    let engine:     String     // "whisper" | "apple"
+    let timestamp   = Date()
 }
 
 // MARK: - Engine
@@ -21,309 +25,318 @@ struct TranslationMessage: Identifiable {
 @MainActor
 final class TranslatorEngine: NSObject {
 
-    // UI state
-    var activeMic:   ActiveMic = .none
-    var isSpeaking   = false
+    // ── UI state ──────────────────────────────────────────────────────────
+    var isListening  = false
+    var isProcessing = false
     var isReady      = false
     var audioLevel:  Float = 0
-    var statusLabel  = "Solicitando permisos..."
+    var statusLabel  = "Initialising…"
     var debugLog:    [String] = []
-
-    // Paneles en vivo
-    var liveEnglish  = ""
-    var liveSpanish  = ""
-    var messages:    [TranslationMessage] = []
     var errorMessage: String?
+    var liveTranscript = ""          // "🎤 Listening…" / "⟳ Translating…"
+    var messages:    [TranslationMessage] = []
 
-    // SFSpeechRecognizer — uno por idioma
-    private let recognizerEN = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))!
-    private let recognizerES = SFSpeechRecognizer(locale: Locale(identifier: "es-ES"))!
-    private var activeRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var activeTask:    SFSpeechRecognitionTask?
+    // ── Sub-engines ───────────────────────────────────────────────────────
+    let whisperEngine = WhisperEngine()
+    let appleEngine   = AppleTranslationEngine()
+    var enginePreference: TranslationEngineType = .auto
 
-    // Apple Translation
-    let translator = AppleTranslator()
-
-    // Historia
+    // ── History ───────────────────────────────────────────────────────────
     var store = ConversationStore()
     private var currentConversation = StoredConversation()
 
-    private let audioEngine = AVAudioEngine()
-    private let synthesizer = AVSpeechSynthesizer()
+    // ── Audio ─────────────────────────────────────────────────────────────
+    private let audioEngine   = AVAudioEngine()
+    private var nativeSampleRate: Double = 44_100
+    private var rawSpeechBuffer: [Float] = []
 
-    // VAD + debounce
-    private var silenceStart: Date? = nil
-    private var debounceTask: Task<Void, Never>?
-    private var blockMic      = false
-    private var isTranslating = false
+    // ── VAD ───────────────────────────────────────────────────────────────
+    private var isSpeechActive  = false
+    private var silenceStart:   Date?
+    private var speechStart:    Date?
+    private let silenceDB:      Float = -42        // threshold dB
+    private let silenceDur:     TimeInterval = 1.2 // silence → commit
+    private let minSpeechDur:   TimeInterval = 0.4 // ignore clips shorter than this
 
-    override init() {
-        super.init()
-        synthesizer.delegate = self
-    }
+    override init() { super.init() }
 
     // MARK: - Boot
 
     func boot() async {
-        let granted = await requestPermissions()
-        guard granted else { return }
+        statusLabel = "Requesting permissions…"
+        guard await requestPermissions() else { return }
+
+        statusLabel = "Loading Whisper model (first run downloads ~500 MB)…"
+        log("Starting Whisper setup")
+        await whisperEngine.setup()
+
+        switch whisperEngine.state {
+        case .ready:
+            log("Whisper ready")
+        case .failed(let e):
+            log("Whisper failed: \(e)")
+            await appleEngine.setup()
+            if appleEngine.isAvailable {
+                log("Apple engine ready (fallback)")
+            } else {
+                errorMessage = "No translation engine available on this device."
+                return
+            }
+        default: break
+        }
+
         isReady     = true
         statusLabel = ""
-        log("Listo")
-    }
-
-    private func log(_ msg: String) {
-        let ts = Date().formatted(.dateTime.hour().minute().second())
-        debugLog.append("[\(ts)] \(msg)")
-        if debugLog.count > 30 { debugLog.removeFirst() }
-        print("DEBUG: \(msg)")
     }
 
     // MARK: - Permissions
 
     private func requestPermissions() async -> Bool {
         let speech = await withCheckedContinuation { cont in
-            SFSpeechRecognizer.requestAuthorization { cont.resume(returning: $0 == .authorized) }
+            SFSpeechRecognizer.requestAuthorization {
+                cont.resume(returning: $0 == .authorized)
+            }
         }
-        guard speech else { errorMessage = "Permiso de reconocimiento de voz denegado."; return false }
+        guard speech else {
+            errorMessage = "Speech recognition permission denied."
+            return false
+        }
         let mic = await AVAudioApplication.requestRecordPermission()
-        guard mic else { errorMessage = "Permiso de micrófono denegado."; return false }
+        guard mic else {
+            errorMessage = "Microphone permission denied."
+            return false
+        }
         return true
     }
 
-    // MARK: - Mic buttons
+    // MARK: - Mic toggle
 
-    func tapEnglishMic() {
-        if activeMic == .english { stopListening(); return }
-        stopListening()
-        activeMic = .english
-        tryStart()
+    func toggleListening() {
+        isListening ? stopListening() : startListening()
     }
 
-    func tapSpanishMic() {
-        if activeMic == .spanish { stopListening(); return }
-        stopListening()
-        activeMic = .spanish
-        tryStart()
+    private func startListening() {
+        do {
+            try startAudio()
+            isListening          = true
+            currentConversation  = StoredConversation()
+            liveTranscript       = ""
+            log("Listening for Thai speech…")
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
-    private func tryStart() {
-        do { try startAudio() }
-        catch { errorMessage = error.localizedDescription }
+    func stopListening() {
+        store.upsert(currentConversation)
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        rawSpeechBuffer = []
+        isSpeechActive  = false
+        silenceStart    = nil
+        speechStart     = nil
+        isListening     = false
+        audioLevel      = 0
+        liveTranscript  = ""
+        try? AVAudioSession.sharedInstance()
+             .setActive(false, options: .notifyOthersOnDeactivation)
+        log("Stopped")
     }
 
-    // MARK: - Audio engine
+    // MARK: - Audio engine (Phase 2.1 – 2.3)
 
     private func startAudio() throws {
-        liveEnglish = ""
-        liveSpanish = ""
-        currentConversation = StoredConversation()
-
         let av = AVAudioSession.sharedInstance()
-        try av.setCategory(.playAndRecord, mode: .voiceChat,
-                           options: [.allowBluetooth, .allowBluetoothA2DP])
+        try av.setCategory(.playAndRecord, mode: .measurement,
+                           options: [.allowBluetooth, .defaultToSpeaker])
         try av.setActive(true)
-        if #available(iOS 18.2, *), av.isEchoCancelledInputAvailable {
-            try av.setPrefersEchoCancelledInput(true)
-        }
 
-        let input  = audioEngine.inputNode
-        let format = input.outputFormat(forBus: 0)
+        let input        = audioEngine.inputNode
+        let nativeFormat = input.outputFormat(forBus: 0)
+        nativeSampleRate = nativeFormat.sampleRate    // store for resampling
 
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buf, _ in
-            guard let self, !self.blockMic else { return }
-            self.activeRequest?.append(buf)
-            self.updateLevel(buf)
+        // Tap at native rate; resample to 16 kHz on main actor before Whisper
+        input.installTap(onBus: 0, bufferSize: 1024, format: nativeFormat) {
+            [weak self] buf, _ in
+            guard let self else { return }
+
+            guard let ch = buf.floatChannelData?[0] else { return }
+            let n = Int(buf.frameLength)
+
+            // Compute RMS on audio thread (no actor hop for simple maths)
+            var sum: Float = 0
+            for i in 0..<n { sum += ch[i] * ch[i] }
+            let rms  = sqrt(sum / Float(max(n, 1)))
+            let db   = 20 * log10(max(rms, 1e-10))
+            let lvl  = max(0, min(1, (db + 60) / 60))
+
+            let samples = Array(UnsafeBufferPointer(start: ch, count: n))
+            Task { @MainActor [weak self] in
+                self?.onAudio(samples: samples, db: db, level: lvl)
+            }
         }
 
         audioEngine.prepare()
         try audioEngine.start()
-        launchRecognitionTask()
     }
 
-    func stopListening() {
-        debounceTask?.cancel()
-        translator.cancel()
-        if activeMic != .none { store.upsert(currentConversation) }
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
-        activeRequest?.endAudio(); activeTask?.cancel()
-        activeRequest = nil; activeTask = nil
-        activeMic    = .none
-        blockMic     = false
-        audioLevel   = 0
-        silenceStart = nil
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-    }
+    // MARK: - VAD + buffer management
 
-    // MARK: - SFSpeechRecognizer (ambos idiomas)
+    private func onAudio(samples: [Float], db: Float, level: Float) {
+        audioLevel = level
+        let now    = Date()
 
-    private func launchRecognitionTask() {
-        let recognizer = activeMic == .english ? recognizerEN : recognizerES
-        guard recognizer.isAvailable else {
-            log("Reconocedor no disponible")
-            return
-        }
+        if db > silenceDB {
+            // ── Active speech ─────────────────────────────────────────────
+            if !isSpeechActive {
+                isSpeechActive = true
+                speechStart    = now
+                liveTranscript = "🎤 Listening…"
+            }
+            silenceStart = nil
+            rawSpeechBuffer.append(contentsOf: samples)
 
-        activeRequest = SFSpeechAudioBufferRecognitionRequest()
-        activeRequest?.shouldReportPartialResults = true
+            // Hard cap: flush at 30 s to avoid huge buffers
+            if rawSpeechBuffer.count > Int(nativeSampleRate * 30) {
+                commitChunk()
+            }
 
-        activeTask = recognizer.recognitionTask(with: activeRequest!) { [weak self] result, error in
-            // Extraer valores primitivos ANTES de cruzar al actor principal
-            let errorCode = (error as NSError?)?.code
-            let text      = result?.bestTranscription.formattedString ?? ""
-            let isFinal   = result?.isFinal ?? false
+        } else {
+            // ── Silence ───────────────────────────────────────────────────
+            if isSpeechActive {
+                rawSpeechBuffer.append(contentsOf: samples)   // include trailing silence
 
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-
-                if errorCode == 1110 {
-                    self.restartRecognitionTask()
-                    return
-                }
-                guard !text.isEmpty else { return }
-
-                self.updateLiveText(text)
-                self.debounceTask?.cancel()
-
-                if isFinal {
-                    self.debounceTask = Task { @MainActor [weak self] in
-                        await self?.handleFinalText(text)
-                    }
-                } else {
-                    self.debounceTask = Task { @MainActor [weak self] in
-                        try? await Task.sleep(for: .milliseconds(1500))
-                        guard !Task.isCancelled, let self else { return }
-                        let silence = self.silenceStart.map { Date().timeIntervalSince($0) } ?? 0
-                        if silence >= 1.2 { await self.handleFinalText(text) }
+                if silenceStart == nil {
+                    silenceStart = now
+                } else if let ss = silenceStart,
+                          now.timeIntervalSince(ss) >= silenceDur {
+                    let speechLen = speechStart.map { now.timeIntervalSince($0) } ?? 0
+                    if speechLen >= minSpeechDur {
+                        commitChunk()
+                    } else {
+                        resetBuffer()        // too short (cough, noise)
                     }
                 }
             }
         }
     }
 
-    private func restartRecognitionTask() {
-        guard activeMic != .none else { return }
-        audioEngine.inputNode.removeTap(onBus: 0)
-        activeRequest?.endAudio(); activeTask?.cancel()
-        activeRequest = nil; activeTask = nil
+    private func commitChunk() {
+        guard !rawSpeechBuffer.isEmpty else { return }
+        let raw = rawSpeechBuffer
+        resetBuffer()
 
-        Task {
-            try? await Task.sleep(for: .milliseconds(200))
-            guard self.activeMic != .none else { return }
-            let input  = self.audioEngine.inputNode
-            let format = input.outputFormat(forBus: 0)
-            input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buf, _ in
-                guard let self, !self.blockMic else { return }
-                self.activeRequest?.append(buf)
-                self.updateLevel(buf)
-            }
-            self.launchRecognitionTask()
+        guard !isProcessing else { log("Dropped chunk (busy)"); return }
+
+        let srcRate = nativeSampleRate
+        Task { [weak self] in
+            guard let self else { return }
+            // Resample to 16 kHz (Whisper requirement) — linear interpolation
+            let s16k = resampleLinear(raw, from: srcRate, to: 16_000)
+            await self.process(samples: s16k)
         }
     }
 
-    // MARK: - Traducción
+    private func resetBuffer() {
+        rawSpeechBuffer = []
+        isSpeechActive  = false
+        silenceStart    = nil
+        speechStart     = nil
+        liveTranscript  = ""
+    }
 
-    private func handleFinalText(_ text: String) async {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isTranslating, activeMic != .none, !trimmed.isEmpty else { return }
+    // MARK: - Resampling (16 kHz for Whisper)
 
-        isTranslating = true
-        defer { isTranslating = false }
+    private func resampleLinear(_ src: [Float], from: Double, to: Double) -> [Float] {
+        guard from != to, !src.isEmpty else { return src }
+        let ratio = from / to                          // e.g. 44100/16000 ≈ 2.756
+        let outN  = Int(Double(src.count) / ratio)
+        var out   = [Float](repeating: 0, count: outN)
+        for i in 0..<outN {
+            let pos = Double(i) * ratio
+            let idx = Int(pos)
+            let frc = Float(pos - Double(idx))
+            out[i]  = idx + 1 < src.count
+                ? src[idx] + frc * (src[idx + 1] - src[idx])
+                : src[min(idx, src.count - 1)]
+        }
+        return out
+    }
 
-        let isEN = activeMic == .english
-        let (from, to, voice, toSpeaker) = isEN
-            ? ("en", "es", "es-ES", false)
-            : ("es", "en", "en-US", true)
+    // MARK: - Translation dispatch (Phase 4 / Phase 6)
 
-        log("Traduciendo (\(from)→\(to)): \"\(trimmed.prefix(40))\"")
+    private func process(samples: [Float]) async {
+        isProcessing   = true
+        liveTranscript = "⟳ Translating…"
+        defer { isProcessing = false }
+
+        let tel    = TelemetryLogger()
+        let useKit: Bool = {
+            switch enginePreference {
+            case .whisper: return whisperEngine.isReady
+            case .apple:   return false
+            case .auto:    return whisperEngine.isReady
+            }
+        }()
 
         do {
-            let translated = try await translator.translate(trimmed, from: from, to: to)
-            log("OK: \"\(translated.prefix(40))\"")
+            tel.start("translate")
+            let text: String
+            let engineTag: String
 
-            let src = isEN ? "en" : "es"
-            messages.append(TranslationMessage(
-                english:    isEN ? trimmed : translated,
-                spanish:    isEN ? translated : trimmed,
-                sourceLang: src
-            ))
+            if useKit {
+                text      = try await whisperEngine.translate(samples)
+                engineTag = "whisper"
+            } else {
+                text      = try await appleEngine.translateAudio(samples)
+                engineTag = "apple"
+            }
+            tel.end("translate", engine: engineTag)
+
+            guard !text.isEmpty else {
+                liveTranscript = ""
+                return
+            }
+
+            liveTranscript = ""
+            let msg = TranslationMessage(english: text, engine: engineTag)
+            messages.append(msg)
             currentConversation.messages.append(
-                StoredMessage(original: trimmed, translated: translated, sourceLang: src)
+                StoredMessage(english: text, engine: engineTag)
             )
             store.upsert(currentConversation)
-            liveEnglish = ""
-            liveSpanish = ""
-            speak(translated, voice: voice, toSpeaker: toSpeaker)
-            // Reiniciar sesión para que la siguiente frase empiece desde cero
-            restartRecognitionTask()
+            log("[\(engineTag)] \(text.prefix(60))")
+
         } catch {
-            log("ERROR traduccion: \(error.localizedDescription) | texto: \"\(trimmed.prefix(30))\"")
-        }
-    }
-
-    // MARK: - Audio level / VAD
-
-    private func updateLiveText(_ text: String) {
-        if activeMic == .english { liveEnglish = text }
-        else                      { liveSpanish = text }
-    }
-
-    private func updateLevel(_ buffer: AVAudioPCMBuffer) {
-        guard let data = buffer.floatChannelData?[0] else { return }
-        let n = Int(buffer.frameLength)
-        guard n > 0 else { return }
-        var sum: Float = 0
-        for i in 0..<n { sum += data[i] * data[i] }
-        let rms = sqrt(sum / Float(n))
-        let db  = 20 * log10(max(rms, 1e-10))
-        let lvl = Float(max(0, min(1, (db + 60) / 60)))
-
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.audioLevel = lvl
-            if db < -40 {
-                if self.silenceStart == nil { self.silenceStart = Date() }
+            liveTranscript = ""
+            // Whisper failed → try Apple fallback once (Phase 6.2 / 6.3)
+            if useKit && appleEngine.isAvailable {
+                log("Whisper error, retrying with Apple: \(error.localizedDescription)")
+                do {
+                    let text = try await appleEngine.translateAudio(samples)
+                    if !text.isEmpty {
+                        let msg = TranslationMessage(english: text, engine: "apple-fallback")
+                        messages.append(msg)
+                        currentConversation.messages.append(
+                            StoredMessage(english: text, engine: "apple-fallback")
+                        )
+                        store.upsert(currentConversation)
+                    }
+                } catch {
+                    log("Fallback also failed: \(error.localizedDescription)")
+                }
             } else {
-                self.silenceStart = nil
+                log("Translation error: \(error.localizedDescription)")
             }
         }
     }
 
-    // MARK: - TTS
+    // MARK: - Debug
 
-    private func speak(_ text: String, voice: String, toSpeaker: Bool) {
-        guard !text.isEmpty else { return }
-        let av = AVAudioSession.sharedInstance()
-        if toSpeaker {
-            try? av.overrideOutputAudioPort(.speaker)
-            blockMic = true
-        } else {
-            try? av.overrideOutputAudioPort(.none)
-            blockMic = false
-        }
-        let u   = AVSpeechUtterance(string: text)
-        u.voice = AVSpeechSynthesisVoice(language: voice)
-        u.rate  = AVSpeechUtteranceDefaultSpeechRate
-        isSpeaking = true
-        synthesizer.speak(u)
-    }
-}
-
-// MARK: - AVSpeechSynthesizerDelegate
-
-extension TranslatorEngine: AVSpeechSynthesizerDelegate {
-    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
-                                       didFinish _: AVSpeechUtterance) {
-        Task { @MainActor in
-            guard !synthesizer.isSpeaking else { return }
-            self.isSpeaking = false
-            try? await Task.sleep(for: .milliseconds(250))
-            self.blockMic = false
-        }
-    }
-    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
-                                       didCancel _: AVSpeechUtterance) {
-        Task { @MainActor in self.isSpeaking = false; self.blockMic = false }
+    private func log(_ msg: String) {
+        let ts = Date().formatted(.dateTime.hour().minute().second())
+        debugLog.append("[\(ts)] \(msg)")
+        if debugLog.count > 40 { debugLog.removeFirst() }
+        print("RT: \(msg)")
     }
 }
