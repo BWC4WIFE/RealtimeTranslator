@@ -15,7 +15,7 @@ on:
 jobs:
   build:
     name: Build ad-hoc signed IPA (iOS 26 · iPhone 16)
-    runs-on: macos-26
+    runs-on: macos-15
 
     env:
       XCODE_PATH: /Applications/Xcode_26.app/Contents/Developer
